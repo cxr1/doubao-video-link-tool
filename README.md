@@ -1,8 +1,10 @@
-# 豆包视频直链提取工具（GUI，Windows 可运行）
+# 短视频直链提取工具（GUI，Windows 可运行）
 
 ## 功能
 - 输入豆包视频分享链接，自动提取 `share_id` 和 `video_id`
+- 输入抖音视频链接，自动提取 `aweme_id`
 - 调用豆包分享接口获取视频直链
+- 自动识别豆包或抖音链接并提取直链
 - 展示：
   - 主链接（`main`）
   - 备用链接（`backup`）
@@ -50,7 +52,7 @@ pyinstaller --onefile --windowed --name DoubaoVideoLinkTool doubao_video_link_gu
 `dist\DoubaoVideoLinkTool.exe`
 
 ## 使用步骤
-1. 粘贴豆包视频分享链接到「分享链接」输入框
+1. 粘贴豆包或抖音视频链接到「分享链接」输入框
 2. 点击「获取视频直链」
 3. 在结果区可选择：
    - 复制链接

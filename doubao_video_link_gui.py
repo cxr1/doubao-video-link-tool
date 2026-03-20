@@ -9,10 +9,14 @@ from tkinter import filedialog, messagebox, ttk
 from urllib.parse import parse_qs, urlparse
 
 import requests
+import urllib3
 from requests import exceptions as req_exc
 
 
 API_URL = "https://www.doubao.com/creativity/share/get_video_share_info"
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+DOUYIN_HOST_KEYS = ("douyin.com", "iesdouyin.com")
+
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -21,6 +25,14 @@ DEFAULT_HEADERS = {
     "Content-Type": "application/json",
     "Origin": "https://www.doubao.com",
     "Referer": "https://www.doubao.com/",
+}
+DOUYIN_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Referer": "https://www.douyin.com/",
 }
 
 
@@ -49,9 +61,21 @@ def parse_share_input(raw: str) -> dict:
         return {}
 
     parsed = urlparse(raw)
+    host = (parsed.netloc or "").lower()
+    if parsed.scheme in ("http", "https") and any(k in host for k in DOUYIN_HOST_KEYS):
+        return {
+            "platform": "douyin",
+            "aweme_id": extract_douyin_aweme_id(raw),
+            "share_id": "",
+            "video_id": "",
+            "creation_id": "",
+            "download_params": "",
+        }
+
     if parsed.scheme in ("http", "https"):
         q = parse_qs(parsed.query)
         return {
+            "platform": "doubao",
             "share_id": (q.get("share_id", [""]) or [""])[0].strip(),
             "video_id": (q.get("video_id", q.get("vid", [""])) or [""])[0].strip(),
             "creation_id": (q.get("creation_id", [""]) or [""])[0].strip(),
@@ -65,12 +89,44 @@ def parse_share_input(raw: str) -> dict:
     if not video_match:
         video_match = re.search(r"\b(v[0-9a-z]{10,})\b", raw, re.I)
 
+    # Prefer Douyin when a typical aweme id pattern is present in non-URL text.
+    aweme_id = extract_douyin_aweme_id(raw)
+    if aweme_id:
+        return {
+            "platform": "douyin",
+            "aweme_id": aweme_id,
+            "share_id": "",
+            "video_id": "",
+            "creation_id": "",
+            "download_params": "",
+        }
+
     return {
+        "platform": "doubao",
         "share_id": (share_match.group(1) if share_match else "").strip(),
         "video_id": (video_match.group(2) if video_match and len(video_match.groups()) > 1 else (video_match.group(1) if video_match else "")).strip(),
         "creation_id": "",
         "download_params": "",
     }
+
+
+def extract_douyin_aweme_id(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    patterns = [
+        r"/video/(\d{10,24})",
+        r"/note/(\d{10,24})",
+        r"/share/video/(\d{10,24})",
+        r"[?&](?:aweme_id|modal_id|group_id|item_id)=(\d{10,24})",
+        r"\b(\d{12,24})\b",
+    ]
+    for p in patterns:
+        m = re.search(p, text)
+        if m:
+            return m.group(1).strip()
+    return ""
 
 
 class DoubaoClient:
@@ -86,6 +142,18 @@ class DoubaoClient:
             headers=headers,
             timeout=self.timeout,
             verify=verify,
+        )
+
+    def _get_once(self, url: str, headers: dict, trust_env: bool, verify: bool, allow_redirects: bool = True, stream: bool = False) -> requests.Response:
+        session = requests.Session()
+        session.trust_env = trust_env
+        return session.get(
+            url,
+            headers=headers,
+            timeout=self.timeout,
+            verify=verify,
+            allow_redirects=allow_redirects,
+            stream=stream,
         )
 
     def request_share_info(self, share_id: str, video_id: str, creation_id: str = "", download_params: str = "", referer: str = "") -> dict:
@@ -155,14 +223,137 @@ class DoubaoClient:
         )
 
     def _get_stream_once(self, url: str, headers: dict, trust_env: bool, verify: bool) -> requests.Response:
-        session = requests.Session()
-        session.trust_env = trust_env
-        return session.get(
-            url,
-            headers=headers,
-            stream=True,
-            timeout=self.timeout,
-            verify=verify,
+        return self._get_once(url, headers, trust_env, verify, allow_redirects=True, stream=True)
+
+    def _get_text_with_attempts(self, url: str, headers: dict, allow_redirects: bool = True) -> tuple[str, str]:
+        attempts = [
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ]
+        last_error = None
+        for trust_env, verify in attempts:
+            try:
+                resp = self._get_once(
+                    url=url,
+                    headers=headers,
+                    trust_env=trust_env,
+                    verify=verify,
+                    allow_redirects=allow_redirects,
+                    stream=False,
+                )
+                resp.raise_for_status()
+                return resp.url, resp.text
+            except req_exc.RequestException as exc:
+                last_error = exc
+                continue
+        raise RuntimeError(f"请求失败：{last_error}")
+
+    def _resolve_redirect_location(self, url: str) -> str:
+        attempts = [
+            (True, True),
+            (True, False),
+            (False, True),
+            (False, False),
+        ]
+        headers = {
+            "User-Agent": DOUYIN_HEADERS["User-Agent"],
+            "Accept": "*/*",
+            "Range": "bytes=0-",
+        }
+        for trust_env, verify in attempts:
+            try:
+                resp = self._get_once(
+                    url=url,
+                    headers=headers,
+                    trust_env=trust_env,
+                    verify=verify,
+                    allow_redirects=False,
+                    stream=False,
+                )
+                if 300 <= resp.status_code < 400 and resp.headers.get("Location"):
+                    return resp.headers["Location"]
+                if resp.status_code in (200, 206):
+                    return resp.url
+            except req_exc.RequestException:
+                continue
+        return url
+
+    @staticmethod
+    def _decode_escaped_url(s: str) -> str:
+        return (
+            (s or "")
+            .replace("\\u002F", "/")
+            .replace("\\/", "/")
+            .replace("\\u0026", "&")
+            .replace("&amp;", "&")
+            .strip()
+        )
+
+    def _extract_douyin_play_urls(self, html: str) -> list[str]:
+        if not html:
+            return []
+
+        # Capture both escaped (https:\u002F\u002F...) and normal URLs.
+        raw_candidates = re.findall(r"https:[^\"'<> \t\r\n]{20,}", html)
+        raw_candidates += re.findall(r"https?://[^\"'<> \t\r\n]{20,}", html)
+
+        urls = []
+        for raw in raw_candidates:
+            u = self._decode_escaped_url(raw)
+            if "aweme/v1/play" in u and "video_id=" in u:
+                urls.append(u)
+
+        uniq = []
+        seen = set()
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                uniq.append(u)
+        return uniq
+
+    def fetch_douyin_video_info(self, source_url: str, aweme_id: str = "") -> VideoInfo:
+        source_url = (source_url or "").strip()
+        if not source_url and not aweme_id:
+            raise RuntimeError("请提供有效的抖音链接。")
+
+        # 1) Resolve input URL (handles v.douyin.com short links).
+        resolved_url = source_url
+        html = ""
+        if source_url:
+            resolved_url, html = self._get_text_with_attempts(source_url, headers=DOUYIN_HEADERS, allow_redirects=True)
+
+        # 2) Find aweme_id from source/resolved/html.
+        aweme_id = aweme_id or extract_douyin_aweme_id(resolved_url) or extract_douyin_aweme_id(source_url) or extract_douyin_aweme_id(html)
+        if not aweme_id:
+            raise RuntimeError("未能识别抖音视频 ID（aweme_id）。")
+
+        # 3) Pull stable share page and extract playwm/play URLs.
+        share_page = f"https://www.iesdouyin.com/share/video/{aweme_id}/"
+        _, share_html = self._get_text_with_attempts(share_page, headers=DOUYIN_HEADERS, allow_redirects=True)
+        play_urls = self._extract_douyin_play_urls(share_html)
+        if not play_urls:
+            raise RuntimeError("未能从抖音分享页提取到视频播放链接。")
+
+        wm_url = play_urls[0]
+        nowm_url = wm_url.replace("/playwm/", "/play/")
+
+        # 4) Resolve 302 jump links to final CDN URLs for better download stability.
+        main_url = self._resolve_redirect_location(nowm_url)
+        backup_url = self._resolve_redirect_location(wm_url)
+
+        return VideoInfo(
+            main_url=main_url,
+            backup_url=backup_url,
+            width=0,
+            height=0,
+            definition="",
+            poster_url="",
+            prompt="抖音视频",
+            nickname="",
+            user_id=aweme_id,
+            raw_data={"aweme_id": aweme_id, "resolved_url": resolved_url, "share_page": share_page},
         )
 
     def download_video(self, url: str, save_path: str, progress_cb=None):
@@ -207,7 +398,7 @@ class DoubaoClient:
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("豆包视频直链提取工具")
+        self.title("短视频直链提取工具")
         self.geometry("920x680")
         self.minsize(860, 620)
 
@@ -215,16 +406,18 @@ class App(tk.Tk):
         self.last_info = None
         self._busy = False
         self._downloading = False
+        self.current_platform = "unknown"
 
         self.url_var = tk.StringVar()
         self.share_id_var = tk.StringVar()
         self.video_id_var = tk.StringVar()
         self.creation_id_var = tk.StringVar()
-        self.status_var = tk.StringVar(value="请输入分享链接后点击“获取视频直链”")
+        self.status_var = tk.StringVar(value="")
         self.meta_var = tk.StringVar(value="分辨率：-")
         self.download_status_var = tk.StringVar(value="下载进度：-")
 
         self._build_ui()
+        self._set_status("请输入分享链接后点击“获取视频直链”")
 
     def _build_ui(self):
         root = ttk.Frame(self, padding=12)
@@ -283,14 +476,38 @@ class App(tk.Tk):
 
     def on_extract(self):
         info = parse_share_input(self.url_var.get())
+        platform = info.get("platform", "")
+        if platform == "douyin":
+            self.share_id_var.set("")
+            self.video_id_var.set(info.get("aweme_id", ""))
+            self.creation_id_var.set("")
+            self._set_status("aweme_id 已提取。", platform="douyin")
+            return
+
         self.share_id_var.set(info.get("share_id", ""))
         self.video_id_var.set(info.get("video_id", ""))
-        if info.get("creation_id"):
-            self.creation_id_var.set(info.get("creation_id", ""))
-        self.status_var.set("已尝试从链接提取参数，可手动修正后继续。")
+        self.creation_id_var.set(info.get("creation_id", ""))
+        self._set_status("已提取参数。", platform="doubao")
 
     def on_fetch(self):
         if self._busy:
+            return
+
+        parsed = parse_share_input(self.url_var.get())
+        platform = parsed.get("platform", "doubao")
+
+        if platform == "douyin":
+            aweme_id = parsed.get("aweme_id", "").strip() or self.video_id_var.get().strip() or self.share_id_var.get().strip()
+            if aweme_id:
+                self.video_id_var.set(aweme_id)
+                self.share_id_var.set("")
+                self.creation_id_var.set("")
+            self.set_busy(True, "正在提取直链...", platform="douyin")
+            threading.Thread(
+                target=self._fetch_worker,
+                args=("douyin", "", aweme_id, "", parsed),
+                daemon=True,
+            ).start()
             return
 
         share_id = self.share_id_var.get().strip()
@@ -298,7 +515,7 @@ class App(tk.Tk):
         creation_id = self.creation_id_var.get().strip()
 
         if not share_id or not video_id:
-            guessed = parse_share_input(self.url_var.get())
+            guessed = parsed
             share_id = share_id or guessed.get("share_id", "").strip()
             video_id = video_id or guessed.get("video_id", "").strip()
             if not creation_id:
@@ -311,26 +528,32 @@ class App(tk.Tk):
             messagebox.showerror("参数不完整", "请提供有效的 share_id 和 video_id（可直接粘贴完整分享链接）。")
             return
 
-        self.set_busy(True, "正在请求接口，请稍候...")
+        self.set_busy(True, "正在请求接口...", platform="doubao")
         threading.Thread(
             target=self._fetch_worker,
-            args=(share_id, video_id, creation_id),
+            args=("doubao", share_id, video_id, creation_id, parsed),
             daemon=True,
         ).start()
 
-    def _fetch_worker(self, share_id: str, video_id: str, creation_id: str):
+    def _fetch_worker(self, platform: str, share_id: str, video_id: str, creation_id: str, parsed: dict):
         try:
-            parsed = parse_share_input(self.url_var.get())
-            info = self.client.fetch_video_info(
-                share_id=share_id,
-                video_id=video_id,
-                creation_id=creation_id,
-                download_params=parsed.get("download_params", ""),
-                referer=(self.url_var.get().strip() or ""),
-            )
+            if platform == "douyin":
+                info = self.client.fetch_douyin_video_info(
+                    source_url=(self.url_var.get().strip() or ""),
+                    aweme_id=(video_id or ""),
+                )
+            else:
+                info = self.client.fetch_video_info(
+                    share_id=share_id,
+                    video_id=video_id,
+                    creation_id=creation_id,
+                    download_params=parsed.get("download_params", ""),
+                    referer=(self.url_var.get().strip() or ""),
+                )
             self.after(0, lambda: self.on_fetch_success(info))
         except Exception as exc:
-            self.after(0, lambda: self.on_fetch_error(str(exc)))
+            err_msg = str(exc)
+            self.after(0, lambda msg=err_msg: self.on_fetch_error(msg))
 
     def on_fetch_success(self, info: VideoInfo):
         self.last_info = info
@@ -341,15 +564,24 @@ class App(tk.Tk):
         definition = info.definition or "-"
         size_str = f"{info.width}x{info.height}" if info.width and info.height else "-"
         self.meta_var.set(f"分辨率：{definition} ({size_str})")
-        self.set_busy(False, "提取成功，可直接复制 main/backup 链接。")
+        platform = "douyin" if info.prompt == "抖音视频" else "doubao"
+        self.set_busy(False, "提取成功，可直接复制 main/backup 链接。", platform=platform)
 
     def on_fetch_error(self, err_msg: str):
         self.set_busy(False, f"提取失败：{err_msg}")
         messagebox.showerror("提取失败", err_msg)
 
-    def set_busy(self, busy: bool, message: str):
+    def _platform_name(self, platform: str) -> str:
+        return {"doubao": "豆包", "douyin": "抖音"}.get(platform, "未识别")
+
+    def _set_status(self, message: str, platform: str | None = None):
+        if platform:
+            self.current_platform = platform
+        self.status_var.set(f"识别结果：{self._platform_name(self.current_platform)} | {message}")
+
+    def set_busy(self, busy: bool, message: str, platform: str | None = None):
         self._busy = busy
-        self.status_var.set(message)
+        self._set_status(message, platform=platform)
 
     def set_text(self, widget: tk.Text, content: str):
         widget.delete("1.0", tk.END)
@@ -361,7 +593,7 @@ class App(tk.Tk):
             return
         self.clipboard_clear()
         self.clipboard_append(value)
-        self.status_var.set("已复制到剪贴板。")
+        self._set_status("已复制到剪贴板。")
 
     def on_preview(self, widget: tk.Text):
         url = widget.get("1.0", tk.END).strip()
@@ -369,7 +601,7 @@ class App(tk.Tk):
             messagebox.showwarning("无法预览", "当前没有可预览的视频链接。")
             return
         webbrowser.open(url)
-        self.status_var.set("已在默认浏览器打开视频预览。")
+        self._set_status("已在默认浏览器打开视频预览。")
 
     def on_download(self, source: str, widget: tk.Text):
         if self._downloading:
@@ -382,7 +614,9 @@ class App(tk.Tk):
             return
 
         share_id = self.share_id_var.get().strip() or "doubao"
-        video_id = self.video_id_var.get().strip() or "video"
+        video_id = self.video_id_var.get().strip() or (self.last_info.user_id if self.last_info else "") or "video"
+        if self.last_info and self.last_info.prompt == "抖音视频":
+            share_id = "douyin"
         default_name = f"{share_id}_{video_id}_{source}.mp4"
         save_path = filedialog.asksaveasfilename(
             title="保存视频",
@@ -396,7 +630,7 @@ class App(tk.Tk):
         self._downloading = True
         self.download_progress["value"] = 0
         self.download_status_var.set("下载进度：准备中...")
-        self.status_var.set("正在下载视频，请稍候...")
+        self._set_status("正在下载视频，请稍候...")
         threading.Thread(target=self._download_worker, args=(url, save_path), daemon=True).start()
 
     def _download_worker(self, url: str, save_path: str):
@@ -404,7 +638,8 @@ class App(tk.Tk):
             self.client.download_video(url, save_path, progress_cb=self._on_download_progress_thread)
             self.after(0, lambda: self._on_download_success(save_path))
         except Exception as exc:
-            self.after(0, lambda: self._on_download_error(str(exc), save_path))
+            err_msg = str(exc)
+            self.after(0, lambda msg=err_msg, path=save_path: self._on_download_error(msg, path))
 
     def _on_download_progress_thread(self, downloaded: int, total: int):
         self.after(0, lambda: self._update_download_progress(downloaded, total))
@@ -425,7 +660,7 @@ class App(tk.Tk):
         self._downloading = False
         self.download_progress["value"] = 100
         self.download_status_var.set(f"下载进度：完成，已保存到 {save_path}")
-        self.status_var.set("下载完成。")
+        self._set_status("下载完成。")
         messagebox.showinfo("下载完成", f"视频已保存到：\n{save_path}")
 
     def _on_download_error(self, err_msg: str, save_path: str):
@@ -436,7 +671,7 @@ class App(tk.Tk):
         except OSError:
             pass
         self.download_status_var.set(f"下载进度：失败（{err_msg}）")
-        self.status_var.set("下载失败。")
+        self._set_status("下载失败。")
         messagebox.showerror("下载失败", err_msg)
 
 
