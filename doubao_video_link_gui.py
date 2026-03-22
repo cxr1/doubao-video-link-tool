@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import os
 import re
@@ -34,6 +35,7 @@ DOUYIN_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Referer": "https://www.douyin.com/",
 }
+PLAYWRIGHT_WAIT_MS = 8000
 
 
 @dataclass
@@ -281,6 +283,26 @@ class DoubaoClient:
         return url
 
     @staticmethod
+    def _is_douyin_page_url(url: str) -> bool:
+        try:
+            host = (urlparse(url).netloc or "").lower()
+        except Exception:
+            return False
+        return any(k in host for k in DOUYIN_HOST_KEYS)
+
+    @staticmethod
+    def _is_aweme_play_api_url(url: str) -> bool:
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        if not path.startswith("/aweme/v1/play"):
+            return False
+        return "aweme.snssdk.com" in host or "douyin.com" in host
+
+    @staticmethod
     def _decode_escaped_url(s: str) -> str:
         return (
             (s or "")
@@ -313,6 +335,172 @@ class DoubaoClient:
                 uniq.append(u)
         return uniq
 
+    @staticmethod
+    def _unique_preserve(items: list[str]) -> list[str]:
+        uniq = []
+        seen = set()
+        for item in items:
+            val = (item or "").strip()
+            if not val or val in seen:
+                continue
+            seen.add(val)
+            uniq.append(val)
+        return uniq
+
+    @staticmethod
+    def _is_douyin_static_demo_url(url: str) -> bool:
+        return "douyinstatic.com/obj/douyin-pc-web/uuu_" in (url or "").lower()
+
+    def _is_direct_douyin_cdn_url(self, url: str) -> bool:
+        if not url:
+            return False
+        low = url.lower()
+        if self._is_aweme_play_api_url(url):
+            return False
+        if "mime_type=video_mp4" in low:
+            return True
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            return False
+        host = (parsed.netloc or "").lower()
+        path = (parsed.path or "").lower()
+        if "douyinvod.com" in host and "/video/" in path:
+            return True
+        if "douyin" in host and "/video/tos/" in path:
+            return True
+        return False
+
+    def _is_invalid_douyin_link(self, url: str) -> bool:
+        if not url:
+            return True
+        if self._is_douyin_static_demo_url(url):
+            return True
+        if self._is_aweme_play_api_url(url):
+            return True
+        if self._is_douyin_page_url(url):
+            return True
+        return not self._is_direct_douyin_cdn_url(url)
+
+    def _pick_main_backup_urls(self, candidates: list[str]) -> tuple[str, str]:
+        urls = self._unique_preserve(candidates)
+        if not urls:
+            return "", ""
+
+        preferred = [
+            u
+            for u in urls
+            if self._is_direct_douyin_cdn_url(u) and not self._is_douyin_static_demo_url(u)
+        ]
+        fallback = [
+            u
+            for u in urls
+            if not self._is_aweme_play_api_url(u)
+            and not self._is_douyin_static_demo_url(u)
+            and not self._is_douyin_page_url(u)
+        ]
+        if not fallback:
+            fallback = urls
+
+        pool = preferred or fallback
+        main_url = pool[0]
+        backup_url = ""
+        for u in pool[1:]:
+            if u != main_url:
+                backup_url = u
+                break
+        if not backup_url:
+            for u in urls:
+                if u != main_url:
+                    backup_url = u
+                    break
+        return main_url, (backup_url or main_url)
+
+    def _extract_douyin_urls_by_playwright(self, source_url: str, aweme_id: str = "") -> dict:
+        source_url = (source_url or "").strip()
+        aweme_id = (aweme_id or "").strip()
+        target_url = source_url or (f"https://www.douyin.com/video/{aweme_id}" if aweme_id else "")
+
+        result = {
+            "main_url": "",
+            "backup_url": "",
+            "resolved_url": target_url,
+            "title": "",
+            "video_sources": [],
+            "network_mp4": [],
+            "network_play_api": [],
+            "error": "",
+        }
+        if not target_url:
+            result["error"] = "playwright: 空链接"
+            return result
+        if importlib.util.find_spec("playwright") is None:
+            result["error"] = "playwright: 未安装 playwright（可执行 python -m pip install playwright）"
+            return result
+
+        try:
+            from playwright.sync_api import sync_playwright
+        except Exception as exc:
+            result["error"] = f"playwright: 导入失败（{exc}）"
+            return result
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/123.0.0.0 Safari/537.36"
+                    )
+                )
+                page = context.new_page()
+
+                def on_response(resp):
+                    url = (resp.url or "").strip()
+                    if not url:
+                        return
+                    low = url.lower()
+                    if ".mp4" in low or "mime_type=video_mp4" in low:
+                        result["network_mp4"].append(url)
+                    if self._is_aweme_play_api_url(url):
+                        result["network_play_api"].append(url)
+
+                page.on("response", on_response)
+                page.goto(target_url, wait_until="domcontentloaded", timeout=max(30000, self.timeout * 5000))
+                page.wait_for_timeout(PLAYWRIGHT_WAIT_MS)
+                result["resolved_url"] = page.url
+                result["title"] = page.title()
+
+                source_urls = page.evaluate(
+                    """
+                    () => {
+                      const out = [];
+                      document.querySelectorAll("video source").forEach((s) => {
+                        if (s && s.src) out.push(s.src);
+                      });
+                      const v = document.querySelector("video");
+                      if (v && v.src) out.push(v.src);
+                      return out;
+                    }
+                    """
+                )
+                result["video_sources"] = source_urls or []
+                browser.close()
+        except Exception as exc:
+            result["error"] = f"playwright: {exc}"
+            return result
+
+        for key in ("video_sources", "network_mp4", "network_play_api"):
+            result[key] = self._unique_preserve(result[key])
+
+        main_url, backup_url = self._pick_main_backup_urls(
+            result["video_sources"] + result["network_mp4"] + result["network_play_api"]
+        )
+        result["main_url"] = main_url
+        result["backup_url"] = backup_url
+        return result
+
     def fetch_douyin_video_info(self, source_url: str, aweme_id: str = "") -> VideoInfo:
         source_url = (source_url or "").strip()
         if not source_url and not aweme_id:
@@ -321,27 +509,75 @@ class DoubaoClient:
         # 1) Resolve input URL (handles v.douyin.com short links).
         resolved_url = source_url
         html = ""
+        resolve_error = ""
         if source_url:
-            resolved_url, html = self._get_text_with_attempts(source_url, headers=DOUYIN_HEADERS, allow_redirects=True)
+            try:
+                resolved_url, html = self._get_text_with_attempts(source_url, headers=DOUYIN_HEADERS, allow_redirects=True)
+            except Exception as exc:
+                resolve_error = str(exc)
 
         # 2) Find aweme_id from source/resolved/html.
         aweme_id = aweme_id or extract_douyin_aweme_id(resolved_url) or extract_douyin_aweme_id(source_url) or extract_douyin_aweme_id(html)
         if not aweme_id:
             raise RuntimeError("未能识别抖音视频 ID（aweme_id）。")
 
-        # 3) Pull stable share page and extract playwm/play URLs.
         share_page = f"https://www.iesdouyin.com/share/video/{aweme_id}/"
-        _, share_html = self._get_text_with_attempts(share_page, headers=DOUYIN_HEADERS, allow_redirects=True)
-        play_urls = self._extract_douyin_play_urls(share_html)
-        if not play_urls:
-            raise RuntimeError("未能从抖音分享页提取到视频播放链接。")
+        used_extractor = ""
+        extract_errors = []
+        playwright_data = {
+            "resolved_url": "",
+            "title": "",
+            "video_sources": [],
+            "network_mp4": [],
+            "network_play_api": [],
+            "error": "",
+        }
 
-        wm_url = play_urls[0]
-        nowm_url = wm_url.replace("/playwm/", "/play/")
+        # 3) First try share page extraction.
+        main_url = ""
+        backup_url = ""
+        try:
+            _, share_html = self._get_text_with_attempts(share_page, headers=DOUYIN_HEADERS, allow_redirects=True)
+            play_urls = self._extract_douyin_play_urls(share_html)
+            if not play_urls:
+                raise RuntimeError("未能从抖音分享页提取到视频播放链接。")
 
-        # 4) Resolve 302 jump links to final CDN URLs for better download stability.
-        main_url = self._resolve_redirect_location(nowm_url)
-        backup_url = self._resolve_redirect_location(wm_url)
+            wm_url = play_urls[0]
+            nowm_url = wm_url.replace("/playwm/", "/play/")
+            main_url = self._resolve_redirect_location(nowm_url)
+            backup_url = self._resolve_redirect_location(wm_url)
+            used_extractor = "share_page"
+        except Exception as exc:
+            extract_errors.append(f"share_page: {exc}")
+
+        # 4) Only fallback to Playwright when we detect wrong links.
+        if self._is_invalid_douyin_link(main_url):
+            extract_errors.append("share_page链接异常，触发 playwright 回退")
+            playwright_data = self._extract_douyin_urls_by_playwright(
+                source_url=(source_url or resolved_url or f"https://www.douyin.com/video/{aweme_id}"),
+                aweme_id=aweme_id,
+            )
+            if playwright_data.get("resolved_url"):
+                resolved_url = playwright_data["resolved_url"]
+
+            pw_main = (playwright_data.get("main_url") or "").strip()
+            pw_backup = (playwright_data.get("backup_url") or "").strip()
+            if pw_main and not self._is_invalid_douyin_link(pw_main):
+                main_url = pw_main
+                backup_url = pw_backup or pw_main
+                used_extractor = "playwright_fallback"
+            elif playwright_data.get("error"):
+                extract_errors.append(playwright_data["error"])
+            elif pw_main:
+                extract_errors.append("playwright 结果仍为异常链接")
+
+        if self._is_invalid_douyin_link(main_url):
+            details = " | ".join([e for e in ([resolve_error] + extract_errors) if e][:3])
+            if details:
+                raise RuntimeError(f"未能提取抖音视频直链。{details}")
+            raise RuntimeError("未能提取抖音视频直链。")
+        if not backup_url or self._is_invalid_douyin_link(backup_url):
+            backup_url = main_url
 
         return VideoInfo(
             main_url=main_url,
@@ -353,7 +589,23 @@ class DoubaoClient:
             prompt="抖音视频",
             nickname="",
             user_id=aweme_id,
-            raw_data={"aweme_id": aweme_id, "resolved_url": resolved_url, "share_page": share_page},
+            raw_data={
+                "aweme_id": aweme_id,
+                "source_url": source_url,
+                "resolved_url": resolved_url,
+                "share_page": share_page,
+                "extractor": used_extractor,
+                "playwright": {
+                    "resolved_url": (playwright_data.get("resolved_url") or ""),
+                    "title": (playwright_data.get("title") or ""),
+                    "video_sources": (playwright_data.get("video_sources") or []),
+                    "network_mp4": (playwright_data.get("network_mp4") or []),
+                    "network_play_api": (playwright_data.get("network_play_api") or []),
+                    "error": (playwright_data.get("error") or ""),
+                },
+                "resolve_error": resolve_error,
+                "extract_errors": extract_errors,
+            },
         )
 
     def download_video(self, url: str, save_path: str, progress_cb=None):

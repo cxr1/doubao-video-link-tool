@@ -5,6 +5,7 @@
 - 输入抖音视频链接，自动提取 `aweme_id`
 - 调用豆包分享接口获取视频直链
 - 自动识别豆包或抖音链接并提取直链
+- 抖音链接默认先走分享页解析；识别到异常链接（如 `aweme/v1/play`、页面链接）时再自动回退到 `Playwright`
 - 展示：
   - 主链接（`main`）
   - 备用链接（`backup`）
@@ -20,8 +21,11 @@
 ## 本地运行
 ```bash
 python -m pip install -r requirements.txt
+python -m playwright install chromium
 python doubao_video_link_gui.py
 ```
+
+> 说明：`playwright` 首次使用需要安装浏览器内核（上面的 `playwright install chromium`）。
 
 ## Windows 打包为 EXE
 ### 方法 1：一键脚本
