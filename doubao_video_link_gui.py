@@ -57,17 +57,42 @@ def tolerant_json_loads(text: str) -> dict:
     return json.loads(text, strict=False)
 
 
+def extract_first_url(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+
+    candidates = re.findall(r"https?://[^\s\"'<>]+", text, flags=re.I)
+    if not candidates:
+        return ""
+
+    trailing = ".,!?;:，。！？；：、)]}】）>"
+    for candidate in candidates:
+        url = candidate.strip().rstrip(trailing)
+        if not url:
+            continue
+        try:
+            parsed = urlparse(url)
+        except Exception:
+            continue
+        if parsed.scheme in ("http", "https") and parsed.netloc:
+            return url
+    return ""
+
+
 def parse_share_input(raw: str) -> dict:
     raw = (raw or "").strip()
     if not raw:
         return {}
 
-    parsed = urlparse(raw)
+    source_url = extract_first_url(raw) or raw
+    parsed = urlparse(source_url)
     host = (parsed.netloc or "").lower()
     if parsed.scheme in ("http", "https") and any(k in host for k in DOUYIN_HOST_KEYS):
         return {
             "platform": "douyin",
-            "aweme_id": extract_douyin_aweme_id(raw),
+            "source_url": source_url,
+            "aweme_id": extract_douyin_aweme_id(source_url) or extract_douyin_aweme_id(raw),
             "share_id": "",
             "video_id": "",
             "creation_id": "",
@@ -78,6 +103,7 @@ def parse_share_input(raw: str) -> dict:
         q = parse_qs(parsed.query)
         return {
             "platform": "doubao",
+            "source_url": source_url,
             "share_id": (q.get("share_id", [""]) or [""])[0].strip(),
             "video_id": (q.get("video_id", q.get("vid", [""])) or [""])[0].strip(),
             "creation_id": (q.get("creation_id", [""]) or [""])[0].strip(),
@@ -96,6 +122,7 @@ def parse_share_input(raw: str) -> dict:
     if aweme_id:
         return {
             "platform": "douyin",
+            "source_url": source_url if parsed.scheme in ("http", "https") else "",
             "aweme_id": aweme_id,
             "share_id": "",
             "video_id": "",
@@ -105,6 +132,7 @@ def parse_share_input(raw: str) -> dict:
 
     return {
         "platform": "doubao",
+        "source_url": source_url if parsed.scheme in ("http", "https") else "",
         "share_id": (share_match.group(1) if share_match else "").strip(),
         "video_id": (video_match.group(2) if video_match and len(video_match.groups()) > 1 else (video_match.group(1) if video_match else "")).strip(),
         "creation_id": "",
@@ -502,7 +530,9 @@ class DoubaoClient:
         return result
 
     def fetch_douyin_video_info(self, source_url: str, aweme_id: str = "") -> VideoInfo:
-        source_url = (source_url or "").strip()
+        raw_source = (source_url or "").strip()
+        source_url = extract_first_url(raw_source)
+        aweme_id = (aweme_id or extract_douyin_aweme_id(raw_source)).strip()
         if not source_url and not aweme_id:
             raise RuntimeError("请提供有效的抖音链接。")
 
@@ -791,7 +821,7 @@ class App(tk.Tk):
         try:
             if platform == "douyin":
                 info = self.client.fetch_douyin_video_info(
-                    source_url=(self.url_var.get().strip() or ""),
+                    source_url=(parsed.get("source_url", "").strip() or self.url_var.get().strip() or ""),
                     aweme_id=(video_id or ""),
                 )
             else:
